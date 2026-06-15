@@ -1,0 +1,23 @@
+[project]
+name = "markov-regime-method"
+version = "2.0.0"
+description = "Statistically rigorous Markov regime model with adaptive labeling, stride-sampled matrix, confidence intervals, and net-of-cost backtesting"
+requires-python = "==3.12.*"
+dependencies = [
+    "yfinance>=0.2",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+hmm = ["hmmlearn>=0.3"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["markov_regime_method*"]
