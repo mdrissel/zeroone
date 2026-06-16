@@ -1,7 +1,7 @@
 [project]
-name = "markov-regime-method"
-version = "2.0.0"
-description = "Statistically rigorous Markov regime model with adaptive labeling, stride-sampled matrix, confidence intervals, and net-of-cost backtesting"
+name = "regime-performance-analytics"
+version = "3.0.0"
+description = "Markov regime model with CTA-grade performance analytics: Burghardt-Liu autocorrelation-corrected Sharpe, correct Sortino ratio (Red Rock/CME method), and regime-conditional interpretation"
 requires-python = "==3.12.*"
 dependencies = [
     "yfinance>=0.2",
@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hmm = ["hmmlearn>=0.3"]
+test = ["pytest>=8.0"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -20,4 +21,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["markov_regime_method*"]
+include = ["regime_performance_analytics*", "markov_regime_method*"]

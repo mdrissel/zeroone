@@ -1,2 +1,2 @@
-"""Markov Regime Method — statistically rigorous regime model with optional HMM."""
-__version__ = "2.0.0"
+"""Backward-compatibility shim. Canonical package is regime_performance_analytics."""
+from regime_performance_analytics import __version__  # noqa: F401
