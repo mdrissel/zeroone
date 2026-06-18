@@ -267,3 +267,115 @@ def skew_classification(sortino: float, corrected_sharpe: float) -> str:
         return f"near-symmetric                   (S÷Sr={ratio:.2f})"
     else:
         return f"negative skew / left-tail risk   (S÷Sr={ratio:.2f} < 0.8)"
+
+
+# ---------------------------------------------------------------------------
+# Upside Potential Ratio (correct method — all N in denominator)
+# ---------------------------------------------------------------------------
+
+def compute_upr(
+    returns: np.ndarray,
+    mar_annual: float,
+    tdd_annual: float,
+    periods_per_year: int = 252,
+) -> float:
+    """Upside Potential Ratio using the correct-method TDD.
+
+    UPR = mean(max(r - MAR_period, 0)) × periods_per_year / TDD_annual
+
+    The TDD_annual must be the value already computed for Sortino (all N in
+    denominator). Passing it in ensures TDD is computed exactly once across
+    Sortino, UPR, and Omega — not redundantly recalculated.
+
+    With all N in the denominator the UPR correctly penalises strategies
+    that capture upside only infrequently — analogous to how correct TDD
+    penalises infrequent but large losses.
+    """
+    r = np.asarray(returns, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) == 0 or not np.isfinite(tdd_annual) or tdd_annual <= 0:
+        return float("nan")
+    mar_period = mar_annual / periods_per_year
+    upside = np.maximum(r - mar_period, 0.0)
+    numerator_annual = float(upside.mean()) * periods_per_year
+    return float(numerator_annual / tdd_annual)
+
+
+# ---------------------------------------------------------------------------
+# Omega ratio
+# ---------------------------------------------------------------------------
+
+def compute_omega(
+    returns: np.ndarray,
+    mar_annual: float,
+    periods_per_year: int = 252,
+) -> float:
+    """Omega ratio: mean upside excess / mean downside shortfall.
+
+    Omega = mean(max(r - MAR, 0)) / mean(max(MAR - r, 0))
+
+    Annualisation factors cancel in numerator and denominator so the
+    result is scale-invariant. Omega > 1 means the right tail outweighs
+    the left tail relative to MAR. Omega < 0.8 flags left-tail dominance.
+    """
+    r = np.asarray(returns, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return float("nan")
+    mar_period = mar_annual / periods_per_year
+    upside = np.maximum(r - mar_period, 0.0)
+    downside = np.maximum(mar_period - r, 0.0)
+    den = float(downside.mean())
+    if den == 0:
+        return float("inf") if float(upside.mean()) > 0 else float("nan")
+    return float(upside.mean() / den)
+
+
+# ---------------------------------------------------------------------------
+# Classification helpers for the skewness diagnostic table
+# ---------------------------------------------------------------------------
+
+def classify_omega(omega: float) -> str:
+    """Classify Omega ratio signal."""
+    if not np.isfinite(omega):
+        return "insufficient data" if np.isnan(omega) else "Strong positive skew"
+    if omega > 1.5:
+        return "Strong positive skew"
+    if omega >= 1.0:
+        return "Mild positive skew"
+    if omega >= 0.8:
+        return "Near neutral"
+    return "Negative skew — left tail dominant"
+
+
+def classify_upr_sortino(ratio: float) -> str:
+    """Classify UPR/Sortino ratio signal."""
+    if not np.isfinite(ratio):
+        return "insufficient data"
+    if ratio > 1.0:
+        return "Capturing upside cleanly"
+    if ratio >= 0.6:
+        return "Partial upside capture"
+    return "Missing upside moves — possible chop or signal timing issue"
+
+
+def classify_sortino_sharpe(ratio: float) -> str:
+    """Classify Sortino/Sharpe divergence (short form for table)."""
+    if not np.isfinite(ratio):
+        return "insufficient data"
+    if ratio > 1.2:
+        return "Positive skew / trend-favorable"
+    if ratio >= 0.8:
+        return "Near-symmetric distribution"
+    return "Negative skew — hidden left-tail risk"
+
+
+def classify_autocorr_sum(rho_sum: float) -> str:
+    """Classify autocorrelation sum (short form for table and synthesis)."""
+    if not np.isfinite(rho_sum):
+        return "insufficient data"
+    if rho_sum < -0.15:
+        return "Trend-favorable"
+    if rho_sum <= 0.10:
+        return "Neutral — monitor"
+    return "Mean-reverting / momentum-in-price"

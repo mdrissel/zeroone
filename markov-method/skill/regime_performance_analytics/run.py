@@ -35,7 +35,20 @@ from .analytics import (
     target_downside_deviation,
     sortino_ratio,
     skew_classification,
+    compute_upr,
+    compute_omega,
+    classify_omega,
+    classify_upr_sortino,
+    classify_sortino_sharpe,
+    classify_autocorr_sum,
 )
+
+_RED = "\033[91m" if sys.stdout.isatty() else ""
+_RESET = "\033[0m" if sys.stdout.isatty() else ""
+
+
+def _flag(text: str, condition: bool) -> str:
+    return f"{_RED}{text}{_RESET}" if condition else text
 
 HMM_FLAG_FILE = Path(__file__).resolve().parent.parent / ".hmm_available"
 
@@ -160,40 +173,84 @@ def _print_sortino_section(
     state_names: list[str],
     mar_annual: float,
 ) -> dict:
-    """Print correct Sortino ratio section (Red Rock / CME method).
+    """Print correct Sortino, UPR, and Omega sections (Red Rock / CME method).
 
-    Returns per-regime Sortino values for the interpretation block.
+    TDD is computed exactly once per series and reused across Sortino, UPR,
+    and Omega — no redundant recalculation.
+
+    Returns dict with overall and per-regime values for all three metrics,
+    plus per-regime TDD (for downstream table/synthesis blocks).
     """
     net_arr = np.array(result["daily_returns_net"], dtype=float)
     states = np.array(result["state_series"], dtype=int)
+    mar_daily = mar_annual / 252
 
-    print(f"\n  ── Sortino Ratio (Red Rock / CME correct method, MAR={mar_annual*100:.1f}%) ──")
+    print(f"\n  ── Sortino / UPR / Omega (Red Rock / CME correct method, MAR={mar_annual*100:.1f}%) ──")
     print("  Correct TDD: all N observations in denominator (zeros above MAR included).")
     print("  Industry error: only N_negative in denominator — cannot distinguish")
     print("  occasional losses from persistent ones. See Red Rock Capital (2008).")
 
-    overall_sortino = sortino_ratio(net_arr, mar_annual=mar_annual)
-    tdd_daily = target_downside_deviation(
-        net_arr, mar=mar_annual / 252
-    )
-    tdd_annual = tdd_daily * np.sqrt(252)
-    mean_annual = float(net_arr.mean()) * 252 if len(net_arr) > 0 else float("nan")
+    # ── Overall ──────────────────────────────────────────────────────────────
+    tdd_d = target_downside_deviation(net_arr, mar=mar_daily)
+    tdd_a = tdd_d * np.sqrt(252)
+    mean_a = float(net_arr.mean()) * 252 if len(net_arr) > 0 else float("nan")
+    if np.isfinite(tdd_a) and tdd_a > 0 and np.isfinite(mean_a):
+        overall_sortino = float((mean_a - mar_annual) / tdd_a)
+    else:
+        overall_sortino = float("nan")
+    overall_upr = compute_upr(net_arr, mar_annual, tdd_a)
+    overall_omega = compute_omega(net_arr, mar_annual)
 
     print(f"\n  Overall:")
-    print(f"    TDD (daily→annual):  {_fmt(tdd_annual*100, '.2f', '%')}")
-    print(f"    Annualised return:   {_fmt(mean_annual*100, '.2f', '%')}")
+    print(f"    TDD (daily→annual):  {_fmt(tdd_a*100, '.2f', '%')}")
+    print(f"    Annualised return:   {_fmt(mean_a*100, '.2f', '%')}")
     print(f"    Sortino ratio:       {_fmt(overall_sortino)}")
+    print(f"    UPR:                 {_fmt(overall_upr)}")
+    omega_str = "∞" if np.isposinf(overall_omega) else _fmt(overall_omega)
+    print(f"    Omega:               {omega_str}  [{classify_omega(overall_omega)}]")
 
+    # ── Per-regime ───────────────────────────────────────────────────────────
     regime_sortino: dict[int, float] = {}
+    regime_upr: dict[int, float] = {}
+    regime_omega: dict[int, float] = {}
+    regime_tdd: dict[int, float] = {}
+
     print(f"\n  Per-regime:")
     for state_idx, name in enumerate(state_names):
         mask = states == state_idx
         rd = net_arr[mask]
-        s = sortino_ratio(rd, mar_annual=mar_annual)
-        regime_sortino[state_idx] = s
-        print(f"    {name:>9s}: {_fmt(s)}")
+        n = int(mask.sum())
 
-    return {"overall": overall_sortino, "per_regime": regime_sortino}
+        # TDD computed once; Sortino, UPR, Omega all derived from it
+        r_tdd_d = target_downside_deviation(rd, mar=mar_daily)
+        r_tdd_a = r_tdd_d * np.sqrt(252) if n >= 5 else float("nan")
+        r_mean_a = float(rd.mean()) * 252 if n >= 5 else float("nan")
+        if np.isfinite(r_tdd_a) and r_tdd_a > 0 and np.isfinite(r_mean_a):
+            s = float((r_mean_a - mar_annual) / r_tdd_a)
+        else:
+            s = float("nan")
+        upr = compute_upr(rd, mar_annual, r_tdd_a)
+        omega = compute_omega(rd, mar_annual)
+
+        regime_sortino[state_idx] = s
+        regime_upr[state_idx] = upr
+        regime_omega[state_idx] = omega
+        regime_tdd[state_idx] = r_tdd_a
+
+        omega_s = "∞" if np.isposinf(omega) else _fmt(omega)
+        print(f"    {name:>9s} (n={n:4d}): Sortino={_fmt(s):>7s}  "
+              f"UPR={_fmt(upr):>7s}  Omega={omega_s:>6s}")
+
+    return {
+        "overall": overall_sortino,
+        "overall_upr": overall_upr,
+        "overall_omega": overall_omega,
+        "overall_tdd": tdd_a,
+        "per_regime": regime_sortino,
+        "upr": regime_upr,
+        "omega": regime_omega,
+        "tdd": regime_tdd,
+    }
 
 
 def _print_interpretation_block(
@@ -261,6 +318,137 @@ def _print_interpretation_block(
             print(f"  — HMM/threshold disagreement periods ({hmm_data.get('disagree_pct', float('nan')):.1f}% of bars).")
             if np.isfinite(rho_disagree):
                 print(f"    Autocorrelation Σρ={rho_disagree:+.3f} — not near-zero, regime signal may still apply.")
+
+
+def _print_skewness_table(
+    state_names: list[str],
+    bl_data: dict,
+    sortino_data: dict,
+) -> None:
+    """Print the per-regime skewness diagnostic table (Step 4)."""
+    nan = float("nan")
+
+    def _row(label: str, value: str, signal: str, flag: bool = False) -> None:
+        signal_out = _flag(signal, flag)
+        print(f"    {label:<26s}  {value:>8s}  {signal_out}")
+
+    all_items = list(enumerate(state_names)) + [(-1, "Overall")]
+    for state_idx, name in all_items:
+        if state_idx == -1:
+            bl = bl_data["overall"]
+            cs = bl.get("sharpe_corrected", nan)
+            s = sortino_data["overall"]
+            upr = sortino_data["overall_upr"]
+            omega = sortino_data["overall_omega"]
+            rho = bl.get("rho_sum", nan)
+        else:
+            bl = bl_data["per_regime"][state_idx]
+            cs = bl.get("sharpe_corrected", nan)
+            s = sortino_data["per_regime"].get(state_idx, nan)
+            upr = sortino_data["upr"].get(state_idx, nan)
+            omega = sortino_data["omega"].get(state_idx, nan)
+            rho = bl.get("rho_sum", nan)
+
+        ss_ratio = s / cs if (np.isfinite(s) and np.isfinite(cs) and cs != 0) else nan
+        us_ratio = upr / s if (np.isfinite(upr) and np.isfinite(s) and s > 0) else nan
+        omega_display = "∞" if np.isposinf(omega) else _fmt(omega)
+
+        print(f"\n  Regime: {name}")
+        print(f"    {'Metric':<26s}  {'Value':>8s}  Signal")
+        print("    " + "-" * 60)
+        _row("Corrected Sharpe", _fmt(cs), "—")
+        _row("Sortino", _fmt(s), "—")
+        _row("UPR", _fmt(upr), "—")
+        _row("Omega", omega_display,
+             classify_omega(omega),
+             flag=np.isfinite(omega) and omega < 0.8)
+        _row("Sortino/Sharpe", _fmt(ss_ratio),
+             classify_sortino_sharpe(ss_ratio),
+             flag=np.isfinite(ss_ratio) and ss_ratio < 0.8)
+        _row("UPR/Sortino", _fmt(us_ratio),
+             classify_upr_sortino(us_ratio),
+             flag=np.isfinite(us_ratio) and us_ratio < 0.6)
+        _row("Autocorrelation sum", _fmt(rho, "+.3f"),
+             classify_autocorr_sum(rho))
+
+
+def _print_regime_synthesis(
+    state_names: list[str],
+    current_state: int,
+    P_stride: np.ndarray,
+    bl_data: dict,
+    sortino_data: dict,
+) -> None:
+    """Print regime signal synthesis for the current regime (Step 5)."""
+    nan = float("nan")
+    name = state_names[current_state]
+
+    bl = bl_data["per_regime"][current_state]
+    cs = bl.get("sharpe_corrected", nan)
+    s = sortino_data["per_regime"].get(current_state, nan)
+    upr = sortino_data["upr"].get(current_state, nan)
+    omega = sortino_data["omega"].get(current_state, nan)
+    rho = bl.get("rho_sum", nan)
+
+    diag = float(P_stride[current_state, current_state])
+    bear_prob = float(P_stride[current_state, 0])
+
+    ss_ratio = s / cs if (np.isfinite(s) and np.isfinite(cs) and cs != 0) else nan
+    us_ratio = upr / s if (np.isfinite(upr) and np.isfinite(s) and s > 0) else nan
+
+    # Classify each dimension
+    omega_class = classify_omega(omega)
+    us_class = classify_upr_sortino(us_ratio)
+    ss_class = classify_sortino_sharpe(ss_ratio)
+    ac_class = classify_autocorr_sum(rho)
+
+    # Signal determination — defensive checked first (overrides all others)
+    defensive = (
+        (np.isfinite(omega) and omega < 0.8)
+        or (np.isfinite(rho) and rho > 0.10)
+        or bear_prob > 0.35
+        or (np.isfinite(ss_ratio) and ss_ratio < 0.8)
+    )
+
+    full_size = (
+        not defensive
+        and diag > 0.70
+        and np.isfinite(rho) and rho < -0.15
+        and (np.isposinf(omega) or (np.isfinite(omega) and omega > 1.5))
+        and np.isfinite(us_ratio) and us_ratio > 1.0
+        and np.isfinite(ss_ratio) and ss_ratio > 1.2
+    )
+
+    reduce = (
+        not full_size and not defensive
+        and (
+            diag < 0.65
+            or (np.isfinite(rho) and -0.15 <= rho <= 0.10)
+            or (np.isfinite(omega) and 0.8 <= omega <= 1.0)
+            or (np.isfinite(us_ratio) and us_ratio < 0.6)
+        )
+    )
+
+    if full_size:
+        signal_line = ">>> SIGNAL: FULL SIZE — all conditions met"
+    elif defensive:
+        signal_line = _flag(">>> SIGNAL: DEFENSIVE — reduce / hedge exposure", True)
+    elif reduce:
+        signal_line = ">>> SIGNAL: REDUCE — one or more thresholds not met"
+    else:
+        signal_line = ">>> SIGNAL: NEUTRAL — mixed conditions, use judgement"
+
+    omega_display = "∞" if np.isposinf(omega) else _fmt(omega)
+
+    print("\n  ── REGIME SIGNAL SYNTHESIS ──")
+    print("  " + "=" * 50)
+    print(f"  Current regime:        {name} (diagonal p={diag:.2f})")
+    print(f"  Autocorrelation sum:   {_fmt(rho, '+.3f')}  [{ac_class}]")
+    print(f"  Omega:                 {omega_display}  [{omega_class}]")
+    print(f"  UPR/Sortino:           {_fmt(us_ratio)}  [{us_class}]")
+    print(f"  Sortino/Sharpe:        {_fmt(ss_ratio)}  [{ss_class}]")
+    print(f"  {signal_line}")
+    print("  " + "=" * 50)
 
 
 def main() -> int:
@@ -415,11 +603,19 @@ def main() -> int:
     # ── Extension 3: Regime-conditional interpretation ─────────────────────
     _print_interpretation_block(state_names, P_stride, bl_data, sortino_data, hmm_data)
 
+    # ── Extension 4: Skewness diagnostic table ─────────────────────────────
+    print("\n  ── Skewness Diagnostic Table ──")
+    _print_skewness_table(state_names, bl_data, sortino_data)
+
+    # ── Extension 5: Regime signal synthesis ───────────────────────────────
+    _print_regime_synthesis(state_names, current_state, P_stride, bl_data, sortino_data)
+
     print("\n" + "=" * 64)
     print(" Regime Performance Analytics — run complete")
     print(" Markov framework: Roan (@RohOnChain). Extended by Lewis Jackson.")
+    print(" Distributional metrics: UPR, Omega, regime signal synthesis added.")
     print(" Burghardt-Liu (2012) autocorrelation correction applied.")
-    print(" Sortino: correct TDD method (Red Rock / CME, all N in denominator).")
+    print(" Sortino/UPR: correct TDD method (Red Rock / CME, all N in denominator).")
     print(" Backtests are historical, not forward-looking.")
     print("=" * 64 + "\n")
     return 0
