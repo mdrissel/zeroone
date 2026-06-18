@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .hmm_available
 markov_regime_method.egg-info/
+regime_performance_analytics.egg-info/

@@ -41,40 +41,40 @@ git --version && docker --version && docker compose version 2>/dev/null && echo 
 - If `git` missing: open `https://git-scm.com/downloads` — wait for confirmation.
 - If `docker` missing: open `https://docs.docker.com/get-docker/` — wait for confirmation.
 
-Probe for an existing Hermes API server and set `HERMES_FOUND`:
+Probe for an existing Hermes API server:
 
 ```bash
 if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
-  HERMES_FOUND=true
   echo "✓ Hermes already running at localhost:8080"
 else
-  HERMES_FOUND=false
-  echo "✗ No Hermes found at localhost:8080 — will spin one up in Phase 3"
+  echo ""
+  echo "✗ No Hermes found at localhost:8080."
+  echo ""
+  echo "  This agent requires the SAR stack to be running. Start it first:"
+  echo "    cd ~/sar && docker compose up -d hermes"
+  echo "  Wait until 'docker ps' shows sar-hermes as healthy, then re-run this onboarding."
+  echo ""
+  exit 1
 fi
 ```
 
-**If `HERMES_FOUND=true`** — read the API key from the running container (try the SAR container name first, then a generic search):
+Read the API key from the running SAR container (use an anchored grep to avoid false matches):
 
 ```bash
-HERMES_API_KEY=$(docker exec sar-hermes env 2>/dev/null | grep API_SERVER_KEY | cut -d= -f2)
-# fallback: scan all containers
-[ -z "$HERMES_API_KEY" ] && HERMES_API_KEY=$(docker ps -q | xargs -I{} docker exec {} env 2>/dev/null | grep API_SERVER_KEY | head -1 | cut -d= -f2)
+HERMES_API_KEY=$(docker exec sar-hermes env 2>/dev/null | grep '^API_SERVER_KEY=' | cut -d= -f2)
+# Validate key is present and not the unset placeholder
+if [ -z "$HERMES_API_KEY" ] || [ "$HERMES_API_KEY" = "change_me_api_key" ]; then
+  echo "✗ Hermes API key is missing or still set to the default placeholder."
+  echo "  Set HERMES_API_SERVER_KEY in ~/sar/.env, restart hermes, then re-run."
+  exit 1
+fi
 echo "Hermes API key: ${HERMES_API_KEY:0:8}..."
 ```
-
-**If `HERMES_FOUND=false`** — generate a key that Phase 3 will write into the new container's config:
-
-```bash
-HERMES_API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(24))")
-echo "Generated Hermes API key: ${HERMES_API_KEY:0:8}..."
-```
-
-Store both `HERMES_FOUND` and `HERMES_API_KEY` — Phase 3 branches on them.
 
 Print when ready:
 ```
 ✓ {Mac/Linux/Windows}  ✓ Git  ✓ Docker
-✓ Hermes: {existing @ localhost:8080 | will be created in Phase 3}
+✓ Hermes: existing @ localhost:8080
 ```
 
 ---
@@ -138,8 +138,6 @@ Create the directory tree at `~/hermes-trading`:
 ├── pyproject.toml
 ├── Dockerfile            ← worker image
 ├── docker-compose.yml    ← local Docker orchestration
-├── hermes/               ← ONLY created if HERMES_FOUND=false
-│   └── Dockerfile        ← builds a fresh Hermes container
 ├── hermes_trading/
 │   ├── __init__.py
 │   ├── run.py            ← entrypoint
@@ -199,31 +197,9 @@ CMD ["uv", "run", "python", "-m", "hermes_trading.run"]
 
 Note: state is intentionally **not** copied into the image — it's mounted from the host at runtime so Hermes can read and edit it directly without container restarts.
 
-**`docker-compose.yml`** — branch on `HERMES_FOUND`:
+**`docker-compose.yml`** — single-service file. The worker reaches the SAR Hermes via `host.docker.internal`.
 
-**Case 1 — Hermes already running (`HERMES_FOUND=true`):** write a single-service file. The worker reaches the existing Hermes via `host.docker.internal`.
-
-```yaml
-name: hermes-trading
-
-services:
-  worker:
-    build: .
-    container_name: hermes-trading-worker
-    env_file: .env
-    volumes:
-      # Mount state from host so Hermes can read/write it directly
-      - ./state:/app/state
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import json,sys; d=json.load(open('/app/state/heartbeat.json')); sys.exit(0)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-```
-
-**Case 2 — No Hermes found (`HERMES_FOUND=false`):** write a two-service file that also builds and starts Hermes. The worker depends on Hermes being healthy before it starts.
+Note: the state directory is also mounted into the SAR Hermes container (see Phase 6) so Hermes can read and edit strategy files without needing to `docker exec` into the worker.
 
 ```yaml
 name: hermes-trading
@@ -234,10 +210,8 @@ services:
     container_name: hermes-trading-worker
     env_file: .env
     volumes:
+      # Mount state from host so both the worker and SAR Hermes can access it directly
       - ./state:/app/state
-    depends_on:
-      hermes:
-        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import json,sys; d=json.load(open('/app/state/heartbeat.json')); sys.exit(0)"]
@@ -245,45 +219,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-  hermes:
-    build:
-      context: ./hermes
-    container_name: hermes-trading-hermes
-    env_file: .env
-    volumes:
-      - hermes-data:/home/hermes/.hermes
-      - ./state:/hermes-trading/state   # same mount so Hermes reads state without exec
-    ports:
-      - "8080:8080"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-volumes:
-  hermes-data:
-```
-
-Also generate `~/hermes-trading/hermes/Dockerfile` for Case 2:
-
-```dockerfile
-FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir 'hermes-agent[mcp]' websockets
-RUN useradd -r -u 1001 -m -d /home/hermes hermes
-ENV HERMES_HOME=/home/hermes/.hermes \
-    API_SERVER_ENABLED=true \
-    API_SERVER_HOST=0.0.0.0 \
-    API_SERVER_PORT=8080
-WORKDIR /home/hermes
-RUN mkdir -p /home/hermes/.hermes && chown -R hermes:hermes /home/hermes
-USER hermes
-EXPOSE 8080
-CMD ["python", "-m", "hermes.server"]
 ```
 
 **`.env`** template — set `HERMES_API_URL` based on `HERMES_FOUND`:
@@ -307,10 +242,12 @@ NEWS_API_KEY=
 
 Substitute both values now — `HERMES_API_URL` and `HERMES_API_KEY` — using the variables set in Phase 1.
 
-Initialise the local uv project:
+Initialise the local uv project (guard against re-runs if the directory already exists):
 
 ```bash
-cd ~/hermes-trading && uv init --no-readme && uv add ccxt yfinance pyyaml httpx aiofiles numpy pandas rich
+cd ~/hermes-trading
+[ -f pyproject.toml ] || uv init --no-readme
+uv add ccxt yfinance pyyaml httpx aiofiles numpy pandas rich
 ```
 
 Print: `✓ Worker scaffolded at ~/hermes-trading`
@@ -319,39 +256,29 @@ Print: `✓ Worker scaffolded at ~/hermes-trading`
 
 ## PHASE 4: START THE WORKER LOCALLY
 
-**If `HERMES_FOUND=true`:** Say: "Step 4 of 6: Starting the worker in Docker. Hermes is already running — just the worker container needs to start."
+Say: "Step 4 of 6: Starting the worker in Docker. The SAR Hermes is already running — just the worker container needs to start."
 
-**If `HERMES_FOUND=false`:** Say: "Step 4 of 6: Starting the worker and Hermes together in Docker. The state directory is mounted from your Mac, so strategy changes take effect immediately — no redeploy needed."
-
-Build and start (compose handles one or two services automatically based on what was written in Phase 3):
+Build and start:
 
 ```bash
 cd ~/hermes-trading && docker compose up -d --build
 ```
 
-**If `HERMES_FOUND=false`:** Hermes builds first — tail its logs until the health check passes before watching the worker:
-
-```bash
-docker logs -f hermes-trading-hermes 2>&1 | grep -m1 "API server"
-```
-
-Then tail the worker startup logs until `Booting hermes-trading worker` (or similar from `run.py`) appears:
+Tail the worker startup logs until `Booting hermes-trading worker` (or similar from `run.py`) appears:
 
 ```bash
 docker logs -f hermes-trading-worker 2>&1 | head -50
 ```
 
-If any build fails: print the last 30 lines of the failing container's logs and stop.
+If the build fails: print the last 30 lines of the failing container's logs and stop.
 
-Confirm all containers are healthy:
+Confirm the container is healthy:
 
 ```bash
 docker ps --filter "name=hermes-trading" --format "table {{.Names}}\t{{.Status}}"
 ```
 
-Print:
-- Case 1: `✓ Worker running. Container: hermes-trading-worker (paper mode) | Hermes: existing @ localhost:8080`
-- Case 2: `✓ Worker running. Container: hermes-trading-worker (paper mode) | Hermes: hermes-trading-hermes @ localhost:8080`
+Print: `✓ Worker running. Container: hermes-trading-worker (paper mode) | Hermes: SAR stack @ localhost:8080`
 
 ---
 
@@ -373,14 +300,14 @@ After ~60s, force a reflection with the deterministic fallback (no Hermes needed
 docker exec hermes-trading-worker uv run python -m hermes_trading.reflect --fallback
 ```
 
-Because the state directory is host-mounted, the result files are already on your Mac — open them directly:
+Because the state directory is host-mounted, the result files are already on your Mac — open them with the OS-correct open command:
 
 ```bash
-open ~/hermes-trading/state/strategy.yaml
+${OPEN_CMD} ~/hermes-trading/state/strategy.yaml
 sleep 2
-open ~/hermes-trading/state/hypotheses.jsonl
+${OPEN_CMD} ~/hermes-trading/state/hypotheses.jsonl
 sleep 2
-open ~/hermes-trading/state/trades.jsonl
+${OPEN_CMD} ~/hermes-trading/state/trades.jsonl
 ```
 
 Say: "Three files just opened. `strategy.yaml` jumped from v01 to v02 — exactly one variable changed. `hypotheses.jsonl` shows the reasoning. `trades.jsonl` is every paper trade so far. That's the deterministic version. Now we hand off to Hermes — and the reasoning gets a lot smarter."
@@ -392,6 +319,28 @@ Say: "Three files just opened. `strategy.yaml` jumped from v01 to v02 — exactl
 Say: "Step 6 of 6: Hermes is already running in your SAR stack at localhost:8080. We're going to give it the trading briefing now — it takes over from here."
 
 **No installation needed** — Hermes is already live at `localhost:8080`.
+
+First, add the state volume mount to the SAR Hermes container so it can read and edit strategy files directly (run this once; it requires restarting the hermes service):
+
+```bash
+cd ~/sar
+grep -q 'hermes-trading/state' docker-compose.yml || \
+  echo "  - ~/hermes-trading/state:/hermes-trading/state" >> /tmp/hermes-state-mount.txt && \
+  echo "⚠ Add the following volume to the 'hermes' service in ~/sar/docker-compose.yml, then run: docker compose up -d hermes" && \
+  cat /tmp/hermes-state-mount.txt
+```
+
+If the mount was just added, wait for the viewer to confirm `docker compose up -d hermes` has completed before continuing.
+
+Validate the API key is ready before posting:
+
+```bash
+if [ -z "${HERMES_API_KEY}" ] || [ "${HERMES_API_KEY}" = "change_me_api_key" ]; then
+  echo "✗ HERMES_API_KEY is unset or still the default — set HERMES_API_SERVER_KEY in ~/sar/.env and restart hermes."
+  exit 1
+fi
+echo "✓ API key validated — posting briefing..."
+```
 
 Post the briefing to Hermes. Substitute `{asset}`, `{return}`, `{drawdown}`, `{sharpe}`, `{reflection_every}` with the real values, and `{HERMES_API_KEY}` with the key from Phase 1:
 
@@ -405,7 +354,7 @@ curl -s http://localhost:8080/v1/chat/completions \
   "messages": [
     {
       "role": "user",
-      "content": "You are now the brain of a self-improving trading agent. Your worker is running in a local Docker container (hermes-trading-worker). Its state files are mounted at ~/hermes-trading/state/ on the host — you can read and edit them directly.\n\nStrategy details (locked in by the operator):\n  Asset:              {asset}\n  Target return:      +{return}% in 30 days\n  Max drawdown:       {drawdown}% (bail above this)\n  Min Sharpe:         {sharpe}\n  Reflection cadence: every {reflection_every} closed trades\n  Rule:               change exactly ONE variable per cycle\n\nYour loop, forever:\n\n1. Every 30 minutes, run `docker logs --tail 200 hermes-trading-worker` to check for new closed trades.\n2. When {reflection_every} new trades have closed since the last reflection: read `~/hermes-trading/state/trades.jsonl` and `~/hermes-trading/state/strategy.yaml` directly (they are host-mounted — no exec needed).\n3. Score them against `~/hermes-trading/state/goal.yaml`. Tag each trade with the market regime it happened in (use the markov-hedge-fund-method skill at ~/.claude/skills/ if installed, else a simple 20-day rolling-return classifier).\n4. Generate 1-3 hypotheses. Each names exactly ONE variable in strategy.yaml and predicts the score direction. Pick the one with the highest confidence.\n5. Apply it: edit `~/hermes-trading/state/strategy.yaml` in place, bump the `version` field, save the prior version to `~/hermes-trading/state/history/v{NNNN}.yaml`, append the hypothesis to `~/hermes-trading/state/hypotheses.jsonl`. Because the state dir is host-mounted, the worker picks up the new strategy on its next read — no container restart needed.\n6. Wait for the next reflection trigger. Repeat.\n\nHard constraint: NEVER change more than one variable per cycle. If you're tempted, save the extra change as a `pending_hypotheses` note and apply it next cycle.\n\nStart watching now. Acknowledge the briefing in one sentence and then enter your standby loop — don't ask follow-up questions, just go."
+      "content": "You are now the brain of a self-improving trading agent. Your worker is running in a local Docker container (hermes-trading-worker). Its state directory is mounted at /hermes-trading/state/ inside your container — you can read and write those files directly using your filesystem tools.\n\nStrategy details (locked in by the operator):\n  Asset:              {asset}\n  Target return:      +{return}% in 30 days\n  Max drawdown:       {drawdown}% (bail above this)\n  Min Sharpe:         {sharpe}\n  Reflection cadence: every {reflection_every} closed trades\n  Rule:               change exactly ONE variable per cycle\n\nYour loop, forever:\n\n1. Every 30 minutes, use your shell tool to run: docker logs --tail 200 hermes-trading-worker\n2. When {reflection_every} new trades have closed since the last reflection: read /hermes-trading/state/trades.jsonl and /hermes-trading/state/strategy.yaml using your filesystem tools (the state dir is mounted into your container — no exec needed).\n3. Score them against /hermes-trading/state/goal.yaml. Tag each trade with the market regime it happened in (use a simple 20-day rolling-return classifier if no dedicated skill is available).\n4. Generate 1-3 hypotheses. Each names exactly ONE variable in strategy.yaml and predicts the score direction. Pick the one with the highest confidence.\n5. Apply it: write the updated strategy.yaml to /hermes-trading/state/strategy.yaml, bump the `version` field, save the prior version to /hermes-trading/state/history/v{NNNN}.yaml, append the hypothesis to /hermes-trading/state/hypotheses.jsonl. Because the state dir is host-mounted, the worker picks up the new strategy on its next read — no container restart needed.\n6. Wait for the next reflection trigger. Repeat.\n\nHard constraint: NEVER change more than one variable per cycle. If you're tempted, save the extra change as a `pending_hypotheses` note and apply it next cycle.\n\nStart watching now. Acknowledge the briefing in one sentence and then enter your standby loop — don't ask follow-up questions, just go."
     }
   ]
 }
@@ -428,12 +377,12 @@ Self-improving trading agent — running.
 Worker:        Docker · hermes-trading-worker (paper mode)
 Strategy:      {asset} · +{return}% target / 30d · max DD {drawdown}% · min Sharpe {sharpe}
 Brain:         Hermes (SAR stack · localhost:8080) — watching the worker, reflecting every {reflection_every} trades
-State:         ~/hermes-trading/state/  ← host-mounted; strategy changes take effect instantly
+State:         ~/hermes-trading/state/  ← host-mounted to both worker and sar-hermes; strategy changes take effect instantly
 Restart:       Docker restarts the worker on crash; no redeploy needed for strategy changes
 
 What happens from here:
   • Worker fires paper trades when entry conditions hit
-  • Every {reflection_every} trades, Hermes reflects and edits strategy.yaml
+  • Every {reflection_every} trades, Hermes reflects and edits strategy.yaml via its filesystem MCP tool
   • One variable changes per cycle — scientific method
   • Every prior strategy version is preserved in state/history/
 
@@ -461,7 +410,8 @@ Then one final line: "Hermes is watching. The worker and Hermes are both running
 - No API keys hardcoded — all reads from `.env`. Every adapter falls back to a free public endpoint.
 - All writes inside `~/hermes-trading/` (host) and `/app` (container). Never touch anything else.
 - If any step fails, **stop**. Plain-English what failed + the single most likely fix. Never retry blindly.
-- OS-correct open command for every "open this" moment. Never print "now open X yourself".
-- Hermes is the SAR container at `localhost:8080` — never attempt to install or start a second Hermes instance.
+- Use `${OPEN_CMD}` (set from `OS_FAMILY`) for every "open this" moment. Never print "now open X yourself" and never hardcode `open`.
+- Hermes is the SAR container at `localhost:8080` — **never** attempt to install or start a second Hermes instance. If Hermes is not running, stop and tell the viewer to start the SAR stack.
 - **One terminal session.** PATH refreshes in place. No "restart your terminal" instructions to the viewer.
 - Strategy file changes are effective immediately because state is host-mounted — never tell the viewer to rebuild or restart the container just to apply a strategy change.
+- Validate `HERMES_API_KEY` is non-empty and not the default placeholder before any API call to Hermes.
