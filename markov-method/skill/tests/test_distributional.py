@@ -168,23 +168,26 @@ def test_upr_sortino_fat_left_tail_exceeds_fat_right_tail():
 # 4. Synthesis signal classification logic
 # ---------------------------------------------------------------------------
 
-def _classify_signal(diag, rho, omega, us_ratio, ss_ratio, bear_prob=0.10):
+def _classify_signal(diag, rho, omega, us_ratio, ss_ratio, bear_prob=0.10, sortino=1.0):
     """Mirror of the synthesis logic in run._print_regime_synthesis.
 
     Defensive is checked first — it overrides full-size.
+    Mirrors all fixes: s<0 → DEFENSIVE; isposinf(upr) satisfies FULL SIZE UPR gate.
+    Note: this helper is a structural risk — see test note below.
     """
     defensive = (
         (np.isfinite(omega) and omega < 0.8)
         or (np.isfinite(rho) and rho > 0.10)
         or bear_prob > 0.35
         or (np.isfinite(ss_ratio) and ss_ratio < 0.8)
+        or (np.isfinite(sortino) and sortino < 0)
     )
     full_size = (
         not defensive
         and diag > 0.70
         and np.isfinite(rho) and rho < -0.15
         and (np.isposinf(omega) or (np.isfinite(omega) and omega > 1.5))
-        and np.isfinite(us_ratio) and us_ratio > 1.0
+        and (np.isposinf(us_ratio) or (np.isfinite(us_ratio) and us_ratio > 1.0))
         and np.isfinite(ss_ratio) and ss_ratio > 1.2
     )
     reduce = (
@@ -258,6 +261,35 @@ def test_synthesis_reduce_omega_near_neutral():
 # ---------------------------------------------------------------------------
 # Classification helper unit tests
 # ---------------------------------------------------------------------------
+
+def test_synthesis_bear_regime_not_forced_defensive():
+    """Bear regime with high self-persistence must NOT be forced defensive.
+
+    Bug: bear_prob = P[0,0] (self-transition) was always > 0.35, making every
+    Bear regime permanently DEFENSIVE. Fix: bear_prob = 0 when current_state == 0.
+    """
+    # High diagonal Bear, trend-favorable — should be FULL SIZE not DEFENSIVE
+    assert _classify_signal(
+        diag=0.82, rho=-0.19, omega=1.87, us_ratio=1.24, ss_ratio=1.41,
+        bear_prob=0.0,  # correctly zero for Bear current state
+    ) == "FULL SIZE"
+
+
+def test_synthesis_negative_sortino_is_defensive():
+    """A losing regime (Sortino < 0) must trigger DEFENSIVE."""
+    assert _classify_signal(
+        diag=0.82, rho=-0.19, omega=1.87, us_ratio=1.24, ss_ratio=1.41,
+        sortino=-0.5,
+    ) == "DEFENSIVE"
+
+
+def test_synthesis_zero_tdd_full_size_via_inf_upr():
+    """All returns above MAR → upr=inf → FULL SIZE gate passes (fix 4)."""
+    assert _classify_signal(
+        diag=0.82, rho=-0.19, omega=float("inf"), us_ratio=float("inf"),
+        ss_ratio=1.41,
+    ) == "FULL SIZE"
+
 
 def test_classify_omega_bands():
     assert classify_omega(2.0) == "Strong positive skew"

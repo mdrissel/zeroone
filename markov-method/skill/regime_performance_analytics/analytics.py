@@ -81,11 +81,21 @@ def corrected_sharpe_monthly(
     sigma_naive = sigma_m * np.sqrt(12)
 
     rho_sum = autocorr_sum(r, n_lags)
-    correction = max(1.0 + 2.0 * rho_sum, 1e-6) if np.isfinite(rho_sum) else 1.0
-    sigma_corrected = sigma_m * np.sqrt(12.0 * correction)
+    if np.isfinite(rho_sum):
+        factor = 1.0 + 2.0 * rho_sum
+        # factor <= 0 means the autocorrelation structure is outside the model's
+        # valid range; clamping to a tiny positive would produce astronomically
+        # inflated Sharpe values, so return nan instead.
+        sigma_corrected = sigma_m * np.sqrt(12.0 * factor) if factor > 0 else nan
+    else:
+        sigma_corrected = sigma_naive
 
     sharpe_naive = mean_annual / sigma_naive if sigma_naive > 0 else nan
-    sharpe_corrected = mean_annual / sigma_corrected if sigma_corrected > 0 else nan
+    sharpe_corrected = (
+        mean_annual / sigma_corrected
+        if np.isfinite(sigma_corrected) and sigma_corrected > 0
+        else nan
+    )
 
     return dict(
         mean_annual=mean_annual,
@@ -130,11 +140,18 @@ def corrected_sharpe_daily(
     sigma_naive = sigma_d * np.sqrt(periods_per_year)
 
     rho_sum = autocorr_sum(r, n_lags)
-    correction = max(1.0 + 2.0 * rho_sum, 1e-6) if np.isfinite(rho_sum) else 1.0
-    sigma_corrected = sigma_d * np.sqrt(periods_per_year * correction)
+    if np.isfinite(rho_sum):
+        factor = 1.0 + 2.0 * rho_sum
+        sigma_corrected = sigma_d * np.sqrt(periods_per_year * factor) if factor > 0 else nan
+    else:
+        sigma_corrected = sigma_naive
 
     sharpe_naive = mean_annual / sigma_naive if sigma_naive > 0 else nan
-    sharpe_corrected = mean_annual / sigma_corrected if sigma_corrected > 0 else nan
+    sharpe_corrected = (
+        mean_annual / sigma_corrected
+        if np.isfinite(sigma_corrected) and sigma_corrected > 0
+        else nan
+    )
 
     return dict(
         mean_annual=mean_annual,

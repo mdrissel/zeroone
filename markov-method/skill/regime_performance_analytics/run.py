@@ -33,7 +33,6 @@ from .analytics import (
     corrected_sharpe_daily,
     regime_autocorr_flag,
     target_downside_deviation,
-    sortino_ratio,
     skew_classification,
     compute_upr,
     compute_omega,
@@ -230,7 +229,7 @@ def _print_sortino_section(
         else:
             s = float("nan")
         upr = compute_upr(rd, mar_annual, r_tdd_a)
-        omega = compute_omega(rd, mar_annual)
+        omega = compute_omega(rd, mar_annual) if n >= 5 else float("nan")
 
         regime_sortino[state_idx] = s
         regime_upr[state_idx] = upr
@@ -349,7 +348,7 @@ def _print_skewness_table(
             omega = sortino_data["omega"].get(state_idx, nan)
             rho = bl.get("rho_sum", nan)
 
-        ss_ratio = s / cs if (np.isfinite(s) and np.isfinite(cs) and cs != 0) else nan
+        ss_ratio = s / cs if (np.isfinite(s) and s >= 0 and np.isfinite(cs) and cs > 0) else nan
         us_ratio = upr / s if (np.isfinite(upr) and np.isfinite(s) and s > 0) else nan
         omega_display = "∞" if np.isposinf(omega) else _fmt(omega)
 
@@ -391,9 +390,15 @@ def _print_regime_synthesis(
     rho = bl.get("rho_sum", nan)
 
     diag = float(P_stride[current_state, current_state])
-    bear_prob = float(P_stride[current_state, 0])
+    # Bear transition probability: P(current → Bear). When current_state IS Bear
+    # (index 0), P_stride[0,0] is the self-persistence, not a cross-transition
+    # risk signal — set to 0 so the DEFENSIVE bear_prob trigger only fires on
+    # non-Bear regimes where transitioning into Bear is a forward-looking risk.
+    bear_prob = float(P_stride[current_state, 0]) if current_state != 0 else 0.0
 
-    ss_ratio = s / cs if (np.isfinite(s) and np.isfinite(cs) and cs != 0) else nan
+    # Require both metrics positive so negative/negative doesn't produce a
+    # spurious positive ratio that masks a losing regime.
+    ss_ratio = s / cs if (np.isfinite(s) and s >= 0 and np.isfinite(cs) and cs > 0) else nan
     us_ratio = upr / s if (np.isfinite(upr) and np.isfinite(s) and s > 0) else nan
 
     # Classify each dimension
@@ -408,6 +413,7 @@ def _print_regime_synthesis(
         or (np.isfinite(rho) and rho > 0.10)
         or bear_prob > 0.35
         or (np.isfinite(ss_ratio) and ss_ratio < 0.8)
+        or (np.isfinite(s) and s < 0)  # losing regime: Sortino negative
     )
 
     full_size = (
@@ -415,7 +421,7 @@ def _print_regime_synthesis(
         and diag > 0.70
         and np.isfinite(rho) and rho < -0.15
         and (np.isposinf(omega) or (np.isfinite(omega) and omega > 1.5))
-        and np.isfinite(us_ratio) and us_ratio > 1.0
+        and (np.isposinf(upr) or (np.isfinite(us_ratio) and us_ratio > 1.0))
         and np.isfinite(ss_ratio) and ss_ratio > 1.2
     )
 
