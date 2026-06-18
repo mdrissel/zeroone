@@ -1,0 +1,156 @@
+//@version=6
+// ============================================================================
+// REGIME ANALYTICS — CTA-grade performance metrics for TradingView
+//
+// Burghardt-Liu (2012) autocorrelation-corrected Sharpe
+//   Reference: "It's the autocorrelation, stupid." Newedge Prime Brokerage.
+//   σ_corrected = σ_daily × √(periods × max(1 + 2Σρ, ε))
+//   When Σρ < 0 (trend-favorable): corrected vol < naive vol → corrected Sharpe is HIGHER.
+//
+// Correct Sortino (Red Rock / CME method)
+//   Reference: Sortino & Price (1994); Red Rock Capital / Brian Rom (2008).
+//   TDD = √(mean(min(r − MAR, 0)²)) — ALL N bars in denominator, not just N_negative.
+//   Industry error uses N_negative: inflates TDD for rare losses vs persistent ones.
+//
+// Regime label: z-score of rolling mean return, normalised over a longer window.
+// ============================================================================
+indicator("Regime Analytics", "RA", overlay=false, max_lines_count=0, max_labels_count=0)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+gG = "Analytics Settings"
+periods    = input.int(252,   "Periods per year",     minval=200, maxval=370,        group=gG, tooltip="252 = stocks/futures/forex  |  365 = crypto/24-7")
+lookback   = input.int(252,   "Lookback (bars)",      minval=60,  maxval=500,        group=gG, tooltip="Rolling window for all metrics. 252 ≈ 1 yr daily, 126 ≈ 6 mo.")
+mar_annual = input.float(0.0, "MAR annual %",         minval=-20, maxval=50, step=0.5, group=gG, tooltip="Minimum Acceptable Return for Sortino. 0 = 'is it profitable?'")
+n_lags     = input.int(5,     "Autocorr lags (Σρ)",   minval=1,   maxval=5,          group=gG, tooltip="Serial autocorrelation lags summed for Burghardt-Liu correction. Paper uses 5.")
+
+gReg = "Regime Label"
+zWin    = input.int(20,    "Fast window (bars)",       minval=5,   maxval=60,         group=gReg, tooltip="Bars for rolling mean return used in z-score numerator")
+zNorm   = input.int(252,   "Norm window (bars)",       minval=60,  maxval=500,        group=gReg, tooltip="Window over which z-score is normalised")
+zThresh = input.float(0.5, "Bull/Bear threshold (σ)",  minval=0.1, maxval=2.0, step=0.1, group=gReg, tooltip="Z-score magnitude that triggers Bull or Bear label")
+showBg  = input.bool(true,  "Show regime background",  group=gReg)
+
+gDisp = "Display"
+showTable = input.bool(true,  "Show analytics table",   group=gDisp)
+showNaive = input.bool(true,  "Show naive Sharpe line", group=gDisp, tooltip="Grey comparison line — toggle off to reduce clutter")
+
+// ============================================================================
+// DAILY RETURNS
+// ============================================================================
+rets      = close / close[1] - 1.0
+mar_daily = mar_annual / 100.0 / float(periods)
+
+// ============================================================================
+// REGIME LABEL — rolling z-score of mean return
+// ============================================================================
+rollMean = ta.sma(rets, zWin)
+zMu      = ta.sma(rollMean, zNorm)
+zSig     = ta.stdev(rollMean, zNorm)
+zScore   = zSig > 0.0 ? (rollMean - zMu) / zSig : 0.0
+
+isBull = zScore >  zThresh
+isBear = zScore < -zThresh
+
+bgcolor(showBg and isBull                   ? color.new(color.green, 92) : na, title="Bull")
+bgcolor(showBg and isBear                   ? color.new(color.red,   92) : na, title="Bear")
+bgcolor(showBg and not isBull and not isBear ? color.new(color.gray, 96) : na, title="Sideways")
+
+// ============================================================================
+// CORE STATISTICS (rolling window = lookback)
+// ============================================================================
+mean_d      = ta.sma(rets, lookback)
+std_d       = ta.stdev(rets, lookback)
+
+mean_ann    = mean_d * float(periods)
+sigma_naive = std_d  * math.sqrt(float(periods))
+sharpe_naive = sigma_naive > 0.0 ? mean_ann / sigma_naive : float(na)
+
+// --- Burghardt-Liu autocorrelation correction ---
+// Σρ = Σ corr(r_t, r_{t-k}) for k = 1..n_lags
+// σ_corrected = σ_daily × √(periods × max(1 + 2Σρ, ε))
+rho1 = nz(ta.correlation(rets, rets[1], lookback), 0.0)
+rho2 = nz(ta.correlation(rets, rets[2], lookback), 0.0)
+rho3 = nz(ta.correlation(rets, rets[3], lookback), 0.0)
+rho4 = nz(ta.correlation(rets, rets[4], lookback), 0.0)
+rho5 = nz(ta.correlation(rets, rets[5], lookback), 0.0)
+
+rho_sum = rho1 +
+          (n_lags >= 2 ? rho2 : 0.0) +
+          (n_lags >= 3 ? rho3 : 0.0) +
+          (n_lags >= 4 ? rho4 : 0.0) +
+          (n_lags >= 5 ? rho5 : 0.0)
+
+correction  = math.max(1.0 + 2.0 * rho_sum, 1e-6)
+sigma_corr  = std_d * math.sqrt(float(periods) * correction)
+sharpe_corr = sigma_corr > 0.0 ? mean_ann / sigma_corr : float(na)
+
+// --- Correct Sortino — all N in denominator (Red Rock / CME method) ---
+// TDD = √(mean(min(r − MAR, 0)²))  ← N_total denominator, not N_negative
+sq_under  = math.pow(math.min(rets - mar_daily, 0.0), 2.0)
+tdd_daily = math.sqrt(ta.sma(sq_under, lookback))
+tdd_ann   = tdd_daily * math.sqrt(float(periods))
+sortino   = tdd_ann > 0.0 ? (mean_ann - mar_annual / 100.0) / tdd_ann : float(na)
+
+// --- Skewness proxy: Sortino ÷ corrected Sharpe ---
+// > 1.2: positive skew / trend-favorable
+// 0.8–1.2: near-symmetric
+// < 0.8: negative skew / hidden left-tail risk
+skew_ratio = not na(sortino) and not na(sharpe_corr) and math.abs(sharpe_corr) > 1e-6 ? sortino / sharpe_corr : float(na)
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+plot(sharpe_corr,                            "Sharpe (corrected)", color.new(color.aqua,   0), 2)
+plot(showNaive ? sharpe_naive : float(na),   "Sharpe (naive)",     color.new(color.gray,  50), 1)
+plot(sortino,                                "Sortino (correct)",  color.new(color.orange, 0), 2)
+hline( 0, "Zero",  color.new(color.gray, 55), hline.style_solid,  linewidth=1)
+hline( 1, "SR=1",  color.new(color.gray, 70), hline.style_dotted, linewidth=1)
+hline(-1, "SR=-1", color.new(color.gray, 70), hline.style_dotted, linewidth=1)
+
+// ============================================================================
+// ANALYTICS TABLE
+// ============================================================================
+f_regime() =>
+    isBull ? "Bull" : isBear ? "Bear" : "Sideways"
+
+f_rho_flag(rho) =>
+    rho < -0.15 ? "trend-favorable" : rho > 0.10 ? "mom/MR" : "neutral"
+
+f_skew(sr) =>
+    not na(sr) ? (sr > 1.2 ? "pos / trend" : sr < 0.8 ? "neg / left-tail" : "near-symm") : "n/a"
+
+f_fmt(v) =>
+    not na(v) ? str.tostring(v, "#.##") : "n/a"
+
+var table t = na
+if showTable and barstate.islast
+    if na(t)
+        t := table.new(position.top_right, 2, 10, border_width=1)
+    hdr   = color.new(color.gray,  20)
+    bg    = color.new(color.black, 60)
+    regBg = isBull ? color.new(color.green, 45) : isBear ? color.new(color.red, 45) : color.new(color.gray, 45)
+    upCol = color.new(#26a69a, 0)
+    dnCol = color.new(#ef5350, 0)
+    cCorr = not na(sharpe_corr) and not na(sharpe_naive) ? (sharpe_corr > sharpe_naive ? upCol : dnCol) : color.white
+
+    table.cell(t, 0, 0, "REGIME ANALYTICS",                    text_color=color.white,  bgcolor=hdr,   text_size=size.small)
+    table.cell(t, 1, 0, "lb=" + str.tostring(lookback),        text_color=color.silver, bgcolor=hdr,   text_size=size.small)
+    table.cell(t, 0, 1, "Regime",            text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 1, f_regime(),           text_color=color.white,  bgcolor=regBg, text_size=size.small)
+    table.cell(t, 0, 2, "Sharpe naive",      text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 2, f_fmt(sharpe_naive),  text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 3, "Sharpe corrected",  text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 3, f_fmt(sharpe_corr),  text_color=cCorr,        bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 4, "Σρ (lags 1–" + str.tostring(n_lags) + ")", text_color=color.silver, bgcolor=bg, text_size=size.small)
+    table.cell(t, 1, 4, f_fmt(rho_sum) + "  " + f_rho_flag(rho_sum), text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(t, 0, 5, "Correction ×",      text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 5, f_fmt(correction),   text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 6, "Sortino (correct)", text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 6, f_fmt(sortino),      text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 7, "Skew class.",       text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 7, f_skew(skew_ratio),  text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 8, "MAR annual",        text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 8, str.tostring(mar_annual, "#.#") + "%", text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(t, 0, 9, "Periods/yr",        text_color=color.silver, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 9, str.tostring(periods), text_color=color.white, bgcolor=bg,   text_size=size.small)
