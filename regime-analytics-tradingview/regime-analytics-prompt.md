@@ -7,6 +7,10 @@ indicator that brings CTA-grade performance analytics to any TradingView chart �
   • Correct Sortino ratio (Red Rock / CME method — all N in denominator, not just N_negative)
   • Skewness classification via Sortino ÷ corrected Sharpe
   • Rolling regime label (Bull / Bear / Sideways) with optional background shading
+  • Bayesian-shrunk fractional Kelly position sizing (Rising-Wyner equivalence), with the
+    estimation-risk shrinkage driven by the Sortino-based t-statistic (not Sharpe), so a
+    positively-skewed strategy is correctly shrunk less than a skew-blind t-stat would
+    shrink it — while the separate variance-risk cap stays tied to true (Sharpe) volatility
 
 The indicator runs in its own pane below the chart. It needs no paid TradingView plan.
 
@@ -31,8 +35,9 @@ STEP 0 — Setup & test run (TradingView MCP)
 =======================================================================
 OPEN WITH A GREETING. Before anything else, say hello and set expectations in 2-3 lines,
 e.g.: "Hey! I'm going to build you a CTA-grade analytics indicator for TradingView —
-Burghardt-Liu corrected Sharpe, correct Sortino, regime label, the works. Takes 3 quick
-questions and a couple of minutes. First, let me check if I can talk to your TradingView."
+Burghardt-Liu corrected Sharpe, correct Sortino, regime label, and Bayesian Kelly sizing —
+the works. Takes a few quick questions and a couple of minutes. First, let me check if I
+can talk to your TradingView."
 THEN proceed.
 
 Goal: guarantee the TradingView MCP is connected and working BEFORE building anything.
@@ -79,9 +84,9 @@ Goal: guarantee the TradingView MCP is connected and working BEFORE building any
   "Built without live compiling — connect the TradingView MCP later for auto-test/fix."
 
 =======================================================================
-STEP 1 — Onboarding (3 questions, one at a time)
+STEP 1 — Onboarding (5 questions, one at a time)
 =======================================================================
-Open with: "Great — three quick questions and I'll have your settings dialled in. All have
+Open with: "Great — five quick questions and I'll have your settings dialled in. All have
 sensible defaults, so 'you pick' works for any of them."
 
 Ask each question separately. Wait for the answer, acknowledge it in your own words, then
@@ -97,6 +102,8 @@ move on. Do not batch them.
 
   Q2 — Lookback window
        WHY: all analytics roll over this many bars. More bars = smoother but slower to react.
+       This window doubles as the sample size (T) for the Kelly t-statistic, so a longer
+       lookback also means more statistical confidence in the sizing suggestion.
        Ask: "Second: how many bars should the rolling analytics look back over?
              Default's 252 (one trading year on daily bars). Common alternatives: 126 (6 months)
              or 504 (2 years). Or say 'you pick'."
@@ -104,13 +111,38 @@ move on. Do not batch them.
 
   Q3 — MAR (Minimum Acceptable Return)
        WHY: the Sortino ratio benchmarks returns against this hurdle. Lower = more lenient.
-       Ask: "Last one: what annual return hurdle should the Sortino use? Default's 0%
+       Ask: "Third: what annual return hurdle should the Sortino use? Default's 0%
              (just 'is it profitable?'). Common alternatives: 5%, or your risk-free rate.
              Say 'you pick' and I'll use 0%."
        Accept a percentage number or "defaults" (→ 0%).
 
-After Q3, summarise back in 2 lines and move straight to STEP 2:
-  E.g.: "Perfect — stocks (252 days), 252-bar lookback, 0% MAR. Building it now."
+  Q4 — Kelly prior skepticism (c)
+       WHY: this sets how much statistical evidence you require before trusting the edge
+       at face value. Stricter = smaller suggested position sizes until a longer, stronger
+       track record accumulates on THIS chart's lookback window.
+       Ask: "Fourth: how skeptical should the Kelly sizing be of what it's seeing?
+             Default's 'Moderate' (c=4) — trusts a t-stat of 2.0 as much as conventional
+             half-Kelly does. 'Strict' (c=9) wants a t-stat above 3.0 before sizing up —
+             good if you tend to backtest across many parameter combinations. 'Lenient'
+             (c=1) trusts the live numbers fastest. Say 'you pick' for Moderate."
+       Options:
+         - "Moderate (c=4) — recommended default"      [default]
+         - "Strict (c=9) — for heavily-optimised setups"
+         - "Lenient (c=1) — trust the live numbers fast"
+
+  Q5 — Variance-risk multiplier (v)
+       WHY: separate from the Bayesian estimation-risk shrinkage, this is the plain
+       fractional-Kelly cap for variance/drawdown control — applied on TOP of the
+       Bayesian shrinkage, not instead of it.
+       Ask: "Last one: independent of statistical confidence, how much of full Kelly's
+             variance exposure are you comfortable carrying? Default's 0.5 (half-Kelly
+             drawdown profile). 0.25 is meaningfully more conservative. Say 'you pick'
+             for 0.5."
+       Accept 0.1–1.0 or "defaults" (→ 0.5). Clamp silently.
+
+After Q5, summarise back in 2-3 lines and move straight to STEP 2:
+  E.g.: "Perfect — stocks (252 days), 252-bar lookback, 0% MAR, Moderate Kelly skepticism,
+  half-Kelly variance cap. Building it now."
 
 =======================================================================
 STEP 2 — Assemble
@@ -125,7 +157,14 @@ Start from the BASE SCRIPT at the bottom of this prompt. Make ONLY these mechani
 
   C. Bake Q3 answer into the `mar_annual` input.float default.
 
-  D. Leave every other line byte-for-byte identical. Do not rewrite logic, rename variables,
+  D. Bake Q4 answer into the `kelly_c` input.float default:
+       Moderate → 4.0
+       Strict   → 9.0
+       Lenient  → 1.0
+
+  E. Bake Q5 answer into the `kelly_v` input.float default.
+
+  F. Leave every other line byte-for-byte identical. Do not rewrite logic, rename variables,
      or invent new helpers. The base script is already correct.
 
 =======================================================================
@@ -159,12 +198,54 @@ Narrate each step in plain English — the user can't see tool calls:
   5. CONFIRM — once errors are empty: "[OK] Compiled clean on your TradingView."
      Note any lines you had to patch so the user knows what changed.
 
+  6. CONTRAST CHECK — once compiled clean, take a screenshot of the rendered table if the
+     MCP tooling supports it (e.g. `tv_screenshot` or equivalent). Visually confirm every
+     table cell's text is legibly distinct from its background, on BOTH a dark and light
+     TradingView theme if you can toggle it. If anything looks borderline, fix it before
+     showing the user (see CONTRAST RULES below) — do not ask the user to find these issues
+     themselves.
+
+=======================================================================
+CONTRAST RULES — apply to every table cell, old and new
+=======================================================================
+The existing table mixes `color.silver` / `color.white` text on a `color.new(color.black, 60)`
+background. At 60% transparency that background is closer to dark grey than black, and on a
+LIGHT TradingView chart theme (white pane background showing through transparency) silver text
+can wash out to near-illegible. Apply these rules across the whole table, including the new
+Kelly rows — fix the existing rows too while you're in here, don't leave them inconsistent:
+
+  - NEVER pair light-grey text on light-transparency dark backgrounds. If a cell's bgcolor
+    transparency is 50 or higher, treat the background as theme-dependent (could render
+    closer to the user's chart background than to black or white) and use a HIGH-CONTRAST,
+    saturated text color, not a desaturated one.
+  - Background cells: use LOW transparency (0–30) for any cell carrying small text, so the
+    fill is a true solid color regardless of chart theme underneath. Reserve high-transparency
+    fills (60+) for full-pane bgcolor() washes only — never for table cells with text in them.
+  - Label column (left): white or near-white text (`color.white`, not `color.silver`) on a
+    solid dark background (`color.new(color.gray, 15)` or darker, NOT 60+ transparency).
+  - Value column (right): default to `color.white` text on a solid `color.new(color.black, 15)`
+    or similar near-opaque background, UNLESS the cell is semantically colored (good/bad,
+    above/below threshold) — in which case use the semantic color rules below.
+  - Semantic coloring (regime cell, corrected-vs-naive comparison, Kelly signal, etc.): use
+    saturated, opaque fills — e.g. `color.new(color.green, 20)` / `color.new(color.red, 20)` —
+    paired with `color.white` text, not the desaturated `color.new(color.green, 45)` /
+    `color.new(color.red, 45)` currently used for the regime cell. 45% transparency on a
+    saturated hue still shifts visibly toward whatever sits behind it.
+  - Header row: keep a clearly distinct, solid background (`color.new(color.gray, 10)` or
+    similar) from the body rows so the table has visible structure at a glance.
+  - After making contrast edits, do a final read-through comparing every `table.cell(...)`
+    call's text_color against its bgcolor argument — confirm none of the transparency values
+    on cells-with-text exceed 30. This is a hard rule, not a suggestion: TradingView users
+    run both dark and light chart themes, and a value that's a deliberate design choice on
+    one theme can be unreadable on the other.
+
 =======================================================================
 STEP 4 — Output
 =======================================================================
 Open with a warm one-liner that names what they built, e.g.:
 "Done — here's your Regime Analytics indicator: Burghardt-Liu corrected Sharpe, correct Sortino,
-and a rolling regime label. Compiled clean. Here it is, then the quick install:"
+a rolling regime label, and Bayesian Kelly sizing. Compiled clean. Here it is, then the quick
+install:"
 
 1. Output the COMPLETE final script in a single ```pinescript code block. Nothing omitted.
    (If you verified in STEP 3, this is the exact compiled-clean version.)
@@ -175,14 +256,16 @@ and a rolling regime label. Compiled clean. Here it is, then the quick install:"
    1. TradingView → bottom panel → "Pine Editor".
    2. Select all, delete, paste this script.
    3. Click "Save", then "Add to chart" — opens in its own pane below the chart.
-   4. Gear icon → settings to adjust lookback, MAR, or regime sensitivity live.
+   4. Gear icon → settings to adjust lookback, MAR, regime sensitivity, or Kelly
+      skepticism live.
 
    Reading the output:
    • Aqua line    = Burghardt-Liu corrected Sharpe (use this one)
    • Grey line    = Naive Sharpe (comparison only — turn off in settings to reduce clutter)
    • Orange line  = Correct Sortino ratio
    • Pane bg      = Green/red/grey → Bull / Bear / Sideways regime
-   • Table (top-right): full analytics snapshot with Σρ flag and skew classification
+   • Table (top-right): full analytics snapshot — Σρ flag, skew classification, and
+     Bayesian Kelly sizing block
 
    What the numbers mean:
    • Corrected Sharpe > Naive Sharpe → negative Σρ (trend-favorable: momentum clusters returns)
@@ -192,6 +275,23 @@ and a rolling regime label. Compiled clean. Here it is, then the quick install:"
    • Skew "neg / left-tail"     → Sortino ÷ Sharpe < 0.8: hidden downside risk (option-writer profile)
    • Sortino uses all N bars in the denominator — NOT just the losing ones (the industry error).
      This means it correctly penalises persistent losses more than rare deep ones.
+   • t-stat (Sharpe)       → live statistical confidence in the corrected Sharpe over this
+     lookback window. Shown for comparison and for the variance-cap interpretation —
+     this is NOT the t-stat that drives k.
+   • t-stat (Sortino)      → live statistical confidence in the correct Sortino ratio over
+     this window. THIS is the t-stat that drives the Bayesian shrinkage below. Below ~1.15
+     the evidence is weak; above ~2.0 it's strong (under Moderate skepticism).
+   • Gap between the two t-stats → itself a skew signal. Sortino t-stat well above Sharpe
+     t-stat confirms positive skew (same direction as the Skew classification row) and
+     means k is being sized up specifically because of upside skew, not just raw signal
+     strength. A wide gap is the live, numeric version of that diagnosis.
+   • k (Bayesian)          → the statistically-consistent fractional Kelly multiplier given
+     the live Sortino t-stat — NOT a fixed 0.5. Rises automatically as the t-stat strengthens,
+     falls automatically as it weakens, independent of the separate variance cap (Q5).
+   • k vs conventional      → flags when fixed half-Kelly would be over- or under-betting
+     relative to what the live evidence actually supports.
+   • This is an ANALYTICS READOUT, not an order — Pine has no broker connection. Use the
+     suggested k as an input to your own position-sizing decision, not an automated trade.
 
 3. End with: "Want to adjust any settings? Tell me what to change and I'll rebuild."
 
@@ -214,6 +314,17 @@ BASE SCRIPT (Pine v6 — edit only as STEP 2 allows)
 //   Industry error uses N_negative: inflates TDD for rare losses vs persistent ones.
 //
 // Regime label: z-score of rolling mean return, normalised over a longer window.
+//
+// Bayesian fractional Kelly (Rising-Wyner equivalence)
+//   Reference: Rising & Wyner (2012), IEEE ISIT; Chopra & Ziemba (1993); MacLean,
+//   Thorp & Ziemba (2010).
+//   t = SR_corrected × √T, where T = lookback (bars in the rolling window).
+//   shrinkage = t² / (t² + c)  — the Bayesian-consistent multiplier given live evidence.
+//   k_total = shrinkage × v    — shrinkage (estimation risk) × fixed variance-risk cap.
+//   Conventional fixed half-Kelly (k=0.5) is Bayesian-consistent ONLY at t≈2.0 (c=4).
+//   Below that, half-Kelly overbets relative to the evidence; above it, half-Kelly
+//   leaves growth on the table. k_total adapts continuously instead of using one
+//   fixed number for every confidence level.
 // ============================================================================
 indicator("Regime Analytics", "RA", overlay=false, max_lines_count=0, max_labels_count=0)
 
@@ -222,7 +333,7 @@ indicator("Regime Analytics", "RA", overlay=false, max_lines_count=0, max_labels
 // ============================================================================
 gG = "Analytics Settings"
 periods    = input.int(252,   "Periods per year",     minval=200, maxval=370,        group=gG, tooltip="252 = stocks/futures/forex  |  365 = crypto/24-7")
-lookback   = input.int(252,   "Lookback (bars)",      minval=60,  maxval=500,        group=gG, tooltip="Rolling window for all metrics. 252 ≈ 1 yr daily, 126 ≈ 6 mo.")
+lookback   = input.int(252,   "Lookback (bars)",      minval=60,  maxval=500,        group=gG, tooltip="Rolling window for all metrics. 252 ≈ 1 yr daily, 126 ≈ 6 mo. Also the Kelly sample size T.")
 mar_annual = input.float(0.0, "MAR annual %",         minval=-20, maxval=50, step=0.5, group=gG, tooltip="Minimum Acceptable Return for Sortino. 0 = 'is it profitable?'")
 n_lags     = input.int(5,     "Autocorr lags (Σρ)",   minval=1,   maxval=5,          group=gG, tooltip="Serial autocorrelation lags summed for Burghardt-Liu correction. Paper uses 5.")
 
@@ -231,6 +342,10 @@ zWin    = input.int(20,    "Fast window (bars)",       minval=5,   maxval=60,   
 zNorm   = input.int(252,   "Norm window (bars)",       minval=60,  maxval=500,        group=gReg, tooltip="Window over which z-score is normalised")
 zThresh = input.float(0.5, "Bull/Bear threshold (σ)",  minval=0.1, maxval=2.0, step=0.1, group=gReg, tooltip="Z-score magnitude that triggers Bull or Bear label")
 showBg  = input.bool(true,  "Show regime background",  group=gReg)
+
+gKelly  = "Bayesian Kelly Sizing"
+kelly_c = input.float(4.0,  "Prior skepticism (c)",    minval=0.5, maxval=20.0, step=0.5, group=gKelly, tooltip="Squared t-stat at which you're 50/50 on the edge being real. 4=Moderate, 9=Strict, 1=Lenient.")
+kelly_v = input.float(0.5,  "Variance-risk cap (v)",   minval=0.1, maxval=1.0, step=0.05, group=gKelly, tooltip="Plain fractional-Kelly cap on variance/drawdown exposure, applied on top of the Bayesian shrinkage. 0.5 = half-Kelly drawdown profile.")
 
 gDisp = "Display"
 showTable = input.bool(true,  "Show analytics table",   group=gDisp)
@@ -253,8 +368,8 @@ zScore   = zSig > 0.0 ? (rollMean - zMu) / zSig : 0.0
 isBull = zScore >  zThresh
 isBear = zScore < -zThresh
 
-bgcolor(showBg and isBull                  ? color.new(color.green, 92) : na, title="Bull")
-bgcolor(showBg and isBear                  ? color.new(color.red,   92) : na, title="Bear")
+bgcolor(showBg and isBull                   ? color.new(color.green, 92) : na, title="Bull")
+bgcolor(showBg and isBear                   ? color.new(color.red,   92) : na, title="Bear")
 bgcolor(showBg and not isBull and not isBear ? color.new(color.gray, 96) : na, title="Sideways")
 
 // ============================================================================
@@ -299,6 +414,31 @@ sortino   = tdd_ann > 0.0 ? (mean_ann - mar_annual / 100.0) / tdd_ann : float(na
 // < 0.8: negative skew / hidden left-tail risk
 skew_ratio = not na(sortino) and not na(sharpe_corr) and math.abs(sharpe_corr) > 1e-6 ? sortino / sharpe_corr : float(na)
 
+// --- Bayesian fractional Kelly (Rising-Wyner equivalence) ---
+// Two t-statistics, two different jobs — not interchangeable:
+//   t_sharpe  = SR_corrected × √T   — drives kelly_v's variance-risk interpretation.
+//               This is the ONLY t-stat valid for the GBM drawdown-probability math
+//               (P(50% drawdown) etc.) because that derivation requires TOTAL variance.
+//   t_sortino = Sortino × √T        — drives the Bayesian shrinkage (estimation-risk
+//               side). Downside deviation is just as legitimate a noise measure for a
+//               t-stat as total volatility, and using it here means a positively-skewed
+//               strategy is correctly shrunk LESS than a Sharpe-only t-stat would shrink
+//               it — the same skew-blindness problem Sharpe has in performance reporting
+//               applies identically to Kelly sizing if left uncorrected.
+// shrinkage = t_sortino² / (t_sortino² + c)
+// k_total   = shrinkage × v
+// The two t-stats are shown side by side in the table; a wide gap between them is itself
+// a live skew signal — same diagnostic logic as the Sortino÷Sharpe skew_ratio above.
+t_stat_sharpe  = not na(sharpe_corr) ? sharpe_corr * math.sqrt(float(lookback)) : float(na)
+t_stat_sortino = not na(sortino)     ? sortino     * math.sqrt(float(lookback)) : float(na)
+t_sq           = not na(t_stat_sortino) ? math.pow(t_stat_sortino, 2.0) : float(na)
+shrinkage      = not na(t_sq) ? t_sq / (t_sq + kelly_c) : float(na)
+k_bayesian     = not na(shrinkage) ? shrinkage * kelly_v : float(na)
+
+// Conventional fixed half-Kelly comparison: is k_bayesian above or below 0.5×v's
+// "intended" reference point? Compare directly against kelly_v as the asymptotic ceiling.
+kelly_vs_conventional = not na(k_bayesian) ? (k_bayesian > kelly_v * 0.9 ? "near ceiling" : k_bayesian < kelly_v * 0.3 ? "well below" : "shrinking toward cap") : "n/a"
+
 // ============================================================================
 // PLOTS
 // ============================================================================
@@ -327,34 +467,44 @@ f_fmt(v) =>
 var table t = na
 if showTable and barstate.islast
     if na(t)
-        t := table.new(position.top_right, 2, 10, border_width=1)
-    hdr   = color.new(color.gray,  20)
-    bg    = color.new(color.black, 60)
-    regBg = isBull ? color.new(color.green, 45) : isBear ? color.new(color.red, 45) : color.new(color.gray, 45)
+        t := table.new(position.top_right, 2, 14, border_width=1)
+    // Solid, low-transparency fills so text stays legible on both dark and light chart themes.
+    hdr   = color.new(color.gray,  10)
+    bg    = color.new(color.black, 15)
+    regBg = isBull ? color.new(color.green, 20) : isBear ? color.new(color.red, 20) : color.new(color.gray, 20)
     upCol = color.new(#26a69a, 0)
     dnCol = color.new(#ef5350, 0)
     cCorr = not na(sharpe_corr) and not na(sharpe_naive) ? (sharpe_corr > sharpe_naive ? upCol : dnCol) : color.white
+    kBg   = not na(k_bayesian) ? (k_bayesian > kelly_v * 0.7 ? color.new(color.green, 20) : k_bayesian < kelly_v * 0.3 ? color.new(color.red, 20) : color.new(color.gray, 20)) : bg
 
-    table.cell(t, 0, 0, "REGIME ANALYTICS",                    text_color=color.white,  bgcolor=hdr,   text_size=size.small)
-    table.cell(t, 1, 0, "lb=" + str.tostring(lookback),        text_color=color.silver, bgcolor=hdr,   text_size=size.small)
-    table.cell(t, 0, 1, "Regime",            text_color=color.white,  bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 1, f_regime(),           text_color=color.white,  bgcolor=regBg, text_size=size.small)
-    table.cell(t, 0, 2, "Sharpe naive",      text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 2, f_fmt(sharpe_naive),  text_color=color.white,  bgcolor=bg,    text_size=size.small)
-    table.cell(t, 0, 3, "Sharpe corrected",  text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 3, f_fmt(sharpe_corr),  text_color=cCorr,        bgcolor=bg,    text_size=size.small)
-    table.cell(t, 0, 4, "Σρ (lags 1–" + str.tostring(n_lags) + ")", text_color=color.silver, bgcolor=bg, text_size=size.small)
-    table.cell(t, 1, 4, f_fmt(rho_sum) + "  " + f_rho_flag(rho_sum), text_color=color.white, bgcolor=bg, text_size=size.small)
-    table.cell(t, 0, 5, "Correction ×",      text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 5, f_fmt(correction),   text_color=color.white,  bgcolor=bg,    text_size=size.small)
-    table.cell(t, 0, 6, "Sortino (correct)", text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 6, f_fmt(sortino),      text_color=color.white,  bgcolor=bg,    text_size=size.small)
-    table.cell(t, 0, 7, "Skew class.",       text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 7, f_skew(skew_ratio),  text_color=color.white,  bgcolor=bg,    text_size=size.small)
-    table.cell(t, 0, 8, "MAR annual",        text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 8, str.tostring(mar_annual, "#.#") + "%", text_color=color.white, bgcolor=bg, text_size=size.small)
-    table.cell(t, 0, 9, "Periods/yr",        text_color=color.silver, bgcolor=bg,    text_size=size.small)
-    table.cell(t, 1, 9, str.tostring(periods), text_color=color.white, bgcolor=bg,   text_size=size.small)
+    table.cell(t, 0, 0,  "REGIME ANALYTICS",                    text_color=color.white,  bgcolor=hdr,   text_size=size.small)
+    table.cell(t, 1, 0,  "lb=" + str.tostring(lookback),        text_color=color.white,  bgcolor=hdr,   text_size=size.small)
+    table.cell(t, 0, 1,  "Regime",            text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 1,  f_regime(),           text_color=color.white,  bgcolor=regBg, text_size=size.small)
+    table.cell(t, 0, 2,  "Sharpe naive",      text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 2,  f_fmt(sharpe_naive),  text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 3,  "Sharpe corrected",  text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 3,  f_fmt(sharpe_corr),  text_color=cCorr,        bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 4,  "Σρ (lags 1–" + str.tostring(n_lags) + ")", text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(t, 1, 4,  f_fmt(rho_sum) + "  " + f_rho_flag(rho_sum), text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(t, 0, 5,  "Correction ×",      text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 5,  f_fmt(correction),   text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 6,  "Sortino (correct)", text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 6,  f_fmt(sortino),      text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 7,  "Skew class.",       text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 7,  f_skew(skew_ratio),  text_color=color.white,  bgcolor=bg,    text_size=size.small)
+    table.cell(t, 0, 8,  "t-stat (Sharpe)",   text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 8,  f_fmt(t_stat_sharpe), text_color=color.white, bgcolor=bg,   text_size=size.small)
+    table.cell(t, 0, 9,  "t-stat (Sortino)",  text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 9,  f_fmt(t_stat_sortino), text_color=color.white, bgcolor=bg,  text_size=size.small)
+    table.cell(t, 0, 10, "k (Bayesian)",      text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 10, f_fmt(k_bayesian),   text_color=color.white,  bgcolor=kBg,  text_size=size.small)
+    table.cell(t, 0, 11, "k vs conventional", text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 11, kelly_vs_conventional, text_color=color.white, bgcolor=bg,  text_size=size.small)
+    table.cell(t, 0, 12, "MAR annual",        text_color=color.white, bgcolor=bg,    text_size=size.small)
+    table.cell(t, 1, 12, str.tostring(mar_annual, "#.#") + "%", text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(t, 0, 13, "Periods/yr",        text_color=color.white, bgcolor=bg,   text_size=size.small)
+    table.cell(t, 1, 13, str.tostring(periods), text_color=color.white, bgcolor=bg,  text_size=size.small)
 ```
 
 Now begin at STEP 0.
