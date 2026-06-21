@@ -115,6 +115,31 @@ Omega integrates the full return distribution above and below the MAR threshold 
 **How the regime signal synthesis works:**
 FULL SIZE requires all five dimensions to align simultaneously: high regime persistence (diagonal > 0.70), trend-favorable autocorrelation (Σρ < −0.15), strong right-tail dominance (Omega > 1.5), clean upside capture (UPR/Sortino > 1.0), and confirmed positive skew (Sortino/Sharpe > 1.2). DEFENSIVE triggers on any single adverse reading that implies structural left-tail risk or mean-reverting dynamics. REDUCE fires when conditions are mixed but not yet alarming. Defensive overrides full-size — a single red flag cannot be offset by other green flags.
 
+## Confidence Intervals and Estimation Uncertainty
+
+Point estimates of distributional metrics (Sharpe, Sortino, UPR, Omega) carry inherent sampling variance — Fisher Information sets a Cramér-Rao lower bound on how precisely any parameter can be known from finite data. This uncertainty is largest right after regime transitions when the sample size for the new regime is small. To avoid false confidence in early numbers, this skill reports uncertainty via two methods:
+
+1. **Moving Block Bootstrap (Primary):** We use a block bootstrap rather than a naive i.i.d. bootstrap. Naive resampling destroys the serial correlation structure (the momentum/mean-reversion signature) that is critical to trend-following analysis. The block bootstrap preserves this structure by drawing overlapping blocks of consecutive returns.
+2. **Delta Method (Secondary, Fast Check):** We compute asymptotic standard errors using closed-form approximations. For Sharpe, this uses the Lo (2002) formula adjusted for autocorrelation. For Sortino, UPR, and Omega, we use standard Taylor-expanded approximations of partial moments.
+
+> [!WARNING]
+> **Kink-Point Limitation**: The delta method for Sortino, UPR, and Omega treats the indicator function around the Minimum Acceptable Return (MAR) as fixed. This is asymptotically valid, but if a large cluster of returns (e.g. >5%) sits exactly at or near the MAR kink point, the local derivative becomes unreliable. A "KINK-PROXIMITY WARNING" flag will appear if this is detected.
+
+### Interpreting the Agreement Flag
+
+The tool displays an **Agreement** column to compare the two methods:
+- **OK**: The methods roughly agree, supporting the point estimate's stability.
+- **WIDE — caution**: The methods diverge in midpoint or width. This signals the asymptotic assumptions are breaking down (often due to small sample size or fat tails).
+
+**Example Interpretation:**
+
+| Metric          | Point Est. | Bootstrap CI          | Delta-Method CI       | Agreement      |
+|-----------------|------------|-----------------------|-----------------------|----------------|
+| Sharpe (corr)   | 1.42       | [0.88, 2.01]          | [0.95, 1.89]          | OK             |
+| UPR             | 1.20       | [0.40, 2.95]          | [0.50, 1.90]          | WIDE — caution |
+
+In this example, the UPR shows "WIDE — caution". This often happens in short regimes where a few extreme days skew the bootstrap. You should treat the point estimate of 1.20 with significant skepticism, prefer the wider bootstrap CI as the true range of uncertainty, and factor this uncertainty into position sizing by being more conservative.
+
 ## Signal interpretation guide
 
 ### Omega ratio

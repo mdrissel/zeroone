@@ -41,6 +41,14 @@ from .analytics import (
     classify_sortino_sharpe,
     classify_autocorr_sum,
 )
+from .ci import (
+    delta_method_sharpe,
+    delta_method_sortino,
+    delta_method_upr,
+    delta_method_omega,
+    bootstrap_metrics,
+    evaluate_agreement,
+)
 
 _RED = "\033[91m" if sys.stdout.isatty() else ""
 _RESET = "\033[0m" if sys.stdout.isatty() else ""
@@ -457,6 +465,112 @@ def _print_regime_synthesis(
     print("  " + "=" * 50)
 
 
+def _format_ci(res: dict, method_active: bool) -> str:
+    """Format CI output bracket."""
+    if not method_active:
+        return f"{'—':^20s}"
+    if not np.isfinite(res.get("ci_lower", float("nan"))):
+        return f"{'NaN':^20s}"
+    return f"[{res['ci_lower']:>5.2f}, {res['ci_upper']:>5.2f}]"
+
+def _print_confidence_intervals_section(
+    result: dict,
+    state_names: list[str],
+    mar_annual: float,
+    ci_method: str,
+    n_bootstrap: int,
+    block_length: int | None,
+    ci_level: float,
+) -> None:
+    """Print the confidence intervals and estimation uncertainty block."""
+    net_arr = np.array(result["daily_returns_net"], dtype=float)
+    states = np.array(result["state_series"], dtype=int)
+    mar_daily = mar_annual / 252
+
+    print(f"\n  ── Estimation Uncertainty & Confidence Intervals ({ci_level*100:.0f}%) ──")
+    
+    do_boot = ci_method in ("bootstrap", "both")
+    do_delta = ci_method in ("delta", "both")
+    
+    if do_boot:
+        print(f"  Bootstrap: Moving block bootstrap (n={n_bootstrap} resamples).")
+    if do_delta:
+        print("  Delta Method: Asymptotic standard errors (fast check).")
+        
+    all_items = list(enumerate(state_names)) + [(-1, "Overall")]
+    
+    for state_idx, name in all_items:
+        if state_idx == -1:
+            r = net_arr
+            n_obs = len(r)
+        else:
+            mask = states == state_idx
+            r = net_arr[mask]
+            n_obs = int(mask.sum())
+            
+        print(f"\n  Regime: {name}")
+        print(f"    N = {n_obs} observations")
+        
+        if n_obs < 30:
+            print(f"    {_flag('⚠ LOW CONFIDENCE — short window, treat point estimates with significant skepticism', True)}")
+        elif n_obs < 100:
+            print("    MODERATE CONFIDENCE")
+        else:
+            print("    HIGHER CONFIDENCE — still subject to regime-specific Fisher Information limits")
+
+        boot = {"sharpe": {}, "sortino": {}, "upr": {}, "omega": {}}
+        if do_boot and n_obs >= 10:
+            if state_idx == -1:
+                print(f"    [Computing overall bootstrap...]")
+            else:
+                print(f"    [Computing regime bootstrap...]")
+            boot = bootstrap_metrics(
+                r, mar_annual=mar_annual, n_resamples=n_bootstrap,
+                block_length=block_length, ci_level=ci_level
+            )
+            
+        delta = {"sharpe": {}, "sortino": {}, "upr": {}, "omega": {}}
+        if do_delta:
+            delta["sharpe"] = delta_method_sharpe(r)
+            delta["sortino"] = delta_method_sortino(r, mar_annual)
+            delta["upr"] = delta_method_upr(r, mar_annual)
+            delta["omega"] = delta_method_omega(r, mar_annual)
+            
+        # Check kink warning
+        if do_delta:
+            kinks = any(delta[m].get("kink_warning", False) for m in ["sortino", "upr", "omega"])
+            if kinks:
+                print(f"    {_flag('⚠ KINK-PROXIMITY WARNING: >5% of returns near MAR. Delta method may be unreliable.', True)}")
+        
+        print("\n    Metric          Point Est.   Bootstrap CI          Delta-Method CI       Agreement")
+        print("    " + "-" * 85)
+        
+        metrics_info = [
+            ("Sharpe (corr)", "sharpe"),
+            ("Sortino", "sortino"),
+            ("UPR", "upr"),
+            ("Omega", "omega"),
+        ]
+        
+        for label, m in metrics_info:
+            if do_delta and m in delta and np.isfinite(delta[m].get("point", float("nan"))):
+                point = delta[m]["point"]
+            elif do_boot and m in boot and np.isfinite(boot[m].get("point", float("nan"))):
+                point = boot[m]["point"]
+            else:
+                point = float("nan")
+                
+            boot_str = _format_ci(boot.get(m, {}), do_boot)
+            delta_str = _format_ci(delta.get(m, {}), do_delta)
+            
+            agreement = "N/A"
+            if do_boot and do_delta:
+                agreement = evaluate_agreement(boot.get(m, {}), delta.get(m, {}))
+            
+            agr_disp = _flag(agreement, agreement == "WIDE — caution")
+            print(f"    {label:<14s}  {_fmt(point):>10s}   {boot_str:20s}  {delta_str:20s}  {agr_disp}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="regime-performance-analytics")
     parser.add_argument("--ticker", default="SPY")
@@ -484,6 +598,14 @@ def main() -> int:
             "or a decimal float e.g. '0.07' for 7%%."
         ),
     )
+    parser.add_argument("--ci-method", default="both", choices=["bootstrap", "delta", "both"],
+                        help="Confidence interval method (default both)")
+    parser.add_argument("--n-bootstrap", type=int, default=2000,
+                        help="Number of block bootstrap resamples (default 2000)")
+    parser.add_argument("--block-length", type=int, default=None,
+                        help="Block length for bootstrap. If omitted, uses n^(1/3) heuristic")
+    parser.add_argument("--ci-level", type=float, default=0.95,
+                        help="Confidence interval level (default 0.95)")
     args = parser.parse_args()
 
     print(f"\nRegime Performance Analytics — ticker={args.ticker} years={args.years} "
@@ -615,6 +737,15 @@ def main() -> int:
 
     # ── Extension 5: Regime signal synthesis ───────────────────────────────
     _print_regime_synthesis(state_names, current_state, P_stride, bl_data, sortino_data)
+
+    # ── Extension 6: Confidence Intervals ──────────────────────────────────
+    _print_confidence_intervals_section(
+        result, state_names, mar_annual,
+        ci_method=args.ci_method,
+        n_bootstrap=args.n_bootstrap,
+        block_length=args.block_length,
+        ci_level=args.ci_level,
+    )
 
     print("\n" + "=" * 64)
     print(" Regime Performance Analytics — run complete")
