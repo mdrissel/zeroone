@@ -9,105 +9,128 @@ from regime_performance_analytics.ci import (
     bootstrap_metrics,
     delta_method_sharpe,
     delta_method_sortino,
-    moving_block_bootstrap,
+    generate_circular_blocks,
+    _hac_covariance_2d,
     evaluate_agreement,
 )
 from regime_performance_analytics.run import _print_confidence_intervals_section
 
 
 def test_known_distribution_coverage():
-    """1. Known-distribution sanity check (coverage test).
-    
-    Generate synthetic returns from a known normal distribution.
-    True annual Sharpe should be roughly within the 95% CI 95% of the time.
-    We just test that a single large sample's CI contains the true value.
-    """
+    """1. Known-distribution sanity check (coverage test)."""
     np.random.seed(42)
     # Mean 0.05/252, Vol 0.15/sqrt(252) => Annual Sharpe ~ 0.333
     mu_daily = 0.05 / 252
     vol_daily = 0.15 / np.sqrt(252)
     true_sharpe = 0.05 / 0.15
     
-    # Generate 5 years of daily returns
     returns = np.random.normal(mu_daily, vol_daily, size=252 * 5)
     
     boot = bootstrap_metrics(returns, n_resamples=500, seed=42)
     sharpe_ci = boot["sharpe"]
     
-    assert sharpe_ci["ci_lower"] <= true_sharpe <= sharpe_ci["ci_upper"], (
-        f"True Sharpe {true_sharpe} outside CI [{sharpe_ci['ci_lower']}, {sharpe_ci['ci_upper']}]"
-    )
+    assert sharpe_ci["ci_lower"] <= true_sharpe <= sharpe_ci["ci_upper"]
     
     delta = delta_method_sharpe(returns)
     assert delta["ci_lower"] <= true_sharpe <= delta["ci_upper"]
 
 
-def test_block_bootstrap_preserves_autocorrelation():
-    """2. Block bootstrap preserves autocorrelation vs naive i.i.d."""
+def test_circular_block_bootstrap_wrap():
+    """2. Test circular block wrap-around logic."""
     np.random.seed(123)
-    # Generate AR(1) process with negative autocorrelation
+    # N=10, block length=4
+    n = 10
+    indices = generate_circular_blocks(n, block_length=4, n_resamples=10, seed=123)
+    
+    assert indices.shape == (10, n)
+    # All indices must be valid
+    assert np.all((indices >= 0) & (indices < n))
+    
+    # Within each block of 4, the difference between adjacent indices should be 1,
+    # except when it wraps around (diff will be -(n-1))
+    for resample in indices:
+        # First block is first 4 elements
+        block = resample[:4]
+        diffs = np.diff(block)
+        # diff is either 1 or -9
+        assert np.all(np.isin(diffs, [1, -(n-1)]))
+
+
+def test_hac_vs_naive_variance():
+    """3. Test HAC covariance produces higher variance under positive AC."""
+    np.random.seed(123)
     n = 1000
-    rho = -0.4
+    rho = 0.5
     returns = np.zeros(n)
     eps = np.random.normal(0, 0.01, n)
     for i in range(1, n):
         returns[i] = rho * returns[i-1] + eps[i]
         
-    def autocorr_sum_1(arr):
-        return np.corrcoef(arr[:-1], arr[1:])[0, 1]
-        
-    orig_ac = autocorr_sum_1(returns)
+    x = returns
+    y = np.minimum(returns, 0)**2
     
-    # Block bootstrap (block size > 1)
-    res_block = moving_block_bootstrap(returns, block_length=10, n_resamples=50, seed=123)
-    ac_block = np.mean([autocorr_sum_1(r) for r in res_block])
+    cov_hac = _hac_covariance_2d(x, y, max_lag=5)
     
-    # Naive bootstrap (block size = 1)
-    res_naive = moving_block_bootstrap(returns, block_length=1, n_resamples=50, seed=123)
-    ac_naive = np.mean([autocorr_sum_1(r) for r in res_naive])
+    # Naive i.i.d covariance of means
+    var_x_naive = np.var(x, ddof=0) / n
+    var_y_naive = np.var(y, ddof=0) / n
     
-    # Block should preserve the negative AC better than naive (which should be ~0)
-    assert ac_block < -0.1, f"Block bootstrap lost AC: {ac_block}"
-    assert abs(ac_naive) < 0.1, f"Naive bootstrap AC not zero: {ac_naive}"
-    assert abs(ac_block - orig_ac) < abs(ac_naive - orig_ac)
+    # Under strong positive AC, HAC variance should be substantially larger
+    assert cov_hac[0, 0] > var_x_naive * 1.5
+    assert cov_hac[1, 1] > var_y_naive * 1.5
+
+
+def test_omega_inf_handling():
+    """4. Test Omega handles zero downside (inf) correctly without poisoning."""
+    # Returns always strictly positive -> no downside -> Omega = inf
+    returns = np.random.uniform(0.01, 0.05, 50)
+    
+    boot = bootstrap_metrics(returns, n_resamples=100, seed=42)
+    omega = boot["omega"]
+    
+    assert omega["point"] == np.inf
+    assert np.isnan(omega["se"])
+    assert np.isnan(omega["bias"])
+    # Percentiles should safely report inf
+    assert omega["ci_upper"] == np.inf
 
 
 def test_kink_proximity_warning():
-    """3. Kink-proximity warning fires correctly."""
+    """5. Kink-proximity warning fires correctly."""
     np.random.seed(42)
-    
-    # Data tightly clustered around MAR (0.0)
     clustered = np.random.normal(0.0, 1e-5, 100)
     delta = delta_method_sortino(clustered, mar_annual=0.0)
     assert delta["kink_warning"] is True
     
-    # Data far from MAR
     far = np.random.normal(0.05, 0.01, 100)
     delta2 = delta_method_sortino(far, mar_annual=0.0)
     assert delta2["kink_warning"] is False
 
 
 def test_agreement_classification():
-    """4. Agreement classification logic."""
-    # Case 1: OK
+    """6. Agreement classification logic."""
     boot_ok = {"ci_lower": 1.0, "ci_upper": 2.0}
     delta_ok = {"ci_lower": 1.05, "ci_upper": 1.95}
     assert evaluate_agreement(boot_ok, delta_ok) == "OK"
     
-    # Case 2: WIDE (midpoints differ by > 25% of boot width)
-    # boot width = 1.0. 25% is 0.25.
-    boot_shift = {"ci_lower": 1.0, "ci_upper": 2.0}  # mid=1.5
-    delta_shift = {"ci_lower": 1.5, "ci_upper": 2.5} # mid=2.0
+    boot_shift = {"ci_lower": 1.0, "ci_upper": 2.0}
+    delta_shift = {"ci_lower": 1.5, "ci_upper": 2.5}
     assert evaluate_agreement(boot_shift, delta_shift) == "WIDE — caution"
     
-    # Case 3: WIDE (widths differ by > 1.5x)
-    boot_wide = {"ci_lower": 1.0, "ci_upper": 3.0}  # width 2.0
-    delta_narrow = {"ci_lower": 1.5, "ci_upper": 2.0} # width 0.5
+    boot_wide = {"ci_lower": 1.0, "ci_upper": 3.0}
+    delta_narrow = {"ci_lower": 1.5, "ci_upper": 2.0}
     assert evaluate_agreement(boot_wide, delta_narrow) == "WIDE — caution"
+    
+    # Inf upper bound handling
+    boot_inf = {"ci_lower": 1.0, "ci_upper": np.inf}
+    delta_inf = {"ci_lower": 1.0, "ci_upper": np.inf}
+    # Should be OK or WIDE depending on logic (if both are inf it's N/A or WIDE)
+    # The code currently says if boot_width is inf and delta_width is NOT inf -> WIDE
+    assert evaluate_agreement(boot_inf, delta_ok) == "WIDE — caution"
 
 
 def test_n_based_confidence_flags(capsys):
-    """5. N-based confidence flag thresholds."""
+    """7. N-based confidence flag thresholds."""
     mar_annual = 0.0
     
     def run_with_n(n):
